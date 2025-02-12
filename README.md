@@ -1,7 +1,7 @@
 # Top-Theta Attention
-Implementation and evaluation **Top-Theta Attention** and **Top-k Attention** on Large Language Models, as presented in the article [Top-Theta Attention: Sparsifying Transformers by Compensated Thresholding](TODO)
+Implementation and evaluation **Top-Theta Attention** on Large Language Models, as presented in the article [Top-Theta Attention: Sparsifying Transformers by Compensated Thresholding](TODO). The idea of Top-Theta is to compare the attention vector against a calibrated threshold in order to keep approximately _k_ important elements (_k_ is a user defined paramter during calibration), thereby dropping the need to load the V-rows for the remaining attention elements. Top-theta avoids the need to search for the precise Top-k that requires full-row and limits the tiling across the sequence dimension.
 
-Testing was done for the LLaMA models on `arc_challenge/hellaswag/arc_easy` datasets for Q&A evaluation (prefill-only tasks) and on humaneval dataset (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
+Testing was done for the LLaMA models on _arc_challenge/hellaswag/arc_easy_ datasets for Q&A evaluation (prefill-only tasks) and on _humaneval_ dataset (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
 
 ## Install
 
