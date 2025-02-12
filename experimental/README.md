@@ -1,0 +1,6 @@
+# Experimental implementations of top-thresholding
+
+To use any of the experimental implementations here, move them to the parent directory and rename to `test_llama.py` and `topk_llama.py`
+
+* **mkc** - multi-k-cumulative calibration. This method collects "threshold as a function of effective-k" curve (interval list) for every calibration sample, then merges (aggregating the effective average k for every interval), and obtaining a monotonously non-increasing function of effective_k(threshold). From the inverse of tthis function, for a given k, a threshold is retrieved. This approach has issues of large memory and long running time (couldn't caliubrate arc_challenge on more than 380 examples and only for llama2-7b - 1TB of memory!)
+* **mkc-on-the-fly** - as the previous approach, just with aggregating as the calibration proceeds. Was developed in an attempt to reduce the memory requirement of the calibration procedure. The issue with this approach is that it didn't reduce memory or runtime requirements because the intervals kept being broken into increasingly finer intervals. Possible solutions could be: (i) do not collect curves for every k from 0 to seq-len, but rather subsameple. (ii) coarsen the resolution of the thresholds to avoid explosion of intervals.
