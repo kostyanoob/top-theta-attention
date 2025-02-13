@@ -29,9 +29,9 @@ echo -e "include: arc_easy.yaml\ntask: arc_easy_calibration\ntest_split: train\n
 pip install -e .
 popd
 
-# Install the current topk_attention repo with its dependencies
-# git clone <HERE COMES THE GITHUB REPO>topk_attention.git or just have the topk_attention directory ready with the code
-pushd topk_attention
+# Install the current top-theta-attention repo with its dependencies
+git clone https://github.com/kostyanoob/top-theta-attention.git
+pushd top-theta-attention
 pip install -r requirements.txt
 popd
 
