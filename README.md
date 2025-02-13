@@ -1,7 +1,7 @@
 # Top-Theta Attention
-Implementation and evaluation **Top-Theta Attention** on Large Language Models, as presented in the article [Top-Theta Attention: Sparsifying Transformers by Compensated Thresholding](TODO). The idea of Top-Theta is to compare the attention vector against a calibrated threshold in order to keep approximately _k_ important elements (_k_ is a user defined paramter during calibration), thereby dropping the need to load the V-rows for the remaining attention elements. Top-theta avoids the need to search for the precise Top-k that requires full-row and limits the tiling across the sequence dimension.
+Implementation and evaluation **Top-Theta Attention** on Large Language Models, as presented in the article [Top-Theta Attention: Sparsifying Transformers by Compensated Thresholding](https://arxiv.org/abs/2502.08363). The idea of Top-Theta is to compare the attention vector against a calibrated threshold in order to keep approximately _k_ important elements (_k_ is a user defined paramter during calibration), thereby dropping the need to load the V-rows for the remaining attention elements. Top-theta avoids the need to search for the precise Top-k that requires full-row and limits the tiling across the sequence dimension.
 
-Testing was done for the LLaMA models on _arc_challenge/hellaswag/arc_easy_ datasets for Q&A evaluation (prefill-only tasks) and on _humaneval_ dataset (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
+Testing was done for the LLaMA models on [arc_challenge/arc_easy](https://huggingface.co/datasets/allenai/ai2_arc)[/hellaswag](https://rowanzellers.com/hellaswag) datasets for Q&A evaluation (prefill-only tasks) and on [humaneval](https://github.com/openai/human-eval) dataset (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
 
 ## Install
 
@@ -89,4 +89,5 @@ python plot_th_llama.py -d "products/2024-04-29_17-29-01_774054" -t "CodeLLaMA-3
 
 1. https://github.com/EleutherAI/lm-evaluation-harness 
 2. https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard 
-3. https://github.com/openai/human-eval
+3. https://huggingface.co/datasets/allenai/ai2_arc
+4. https://github.com/openai/human-eval
