@@ -296,8 +296,6 @@ samples_filename = f"{products_dir_path}/samples.jsonl"
 print(f"Saving generated text samples to {samples_filename}")
 write_jsonl(samples_filename, samples)
 
-
-# TODO: integrate human_eval code (with our patches) or apply a patch to a pulled repo
 print(f"Evaluating generated text samples")
 if args.dataset == "openai_humaneval":
     from human_eval.evaluation import evaluate_functional_correctness
