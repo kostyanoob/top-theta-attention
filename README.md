@@ -10,7 +10,7 @@ Testing was done for the LLaMA models on [arc_challenge/arc_easy](https://huggin
 conda create python=3.9.12 --prefix ./topksandbox
 conda activate $(pwd)/topksandbox
 
-# Install the human_eval repo and enable unsandboxed evaluation of LLM-generated python programs
+# Install the lm-eval harness repo and enable unsandboxed evaluation of LLM-generated python programs
 git clone https://github.com/openai/human-eval.git
 pushd human-eval
 sed -i 's/^#\s*\(.*exec(check_program, exec_globals).*\)/\                        exec(check_program, exec_globals)/'  human_eval/execution.py
