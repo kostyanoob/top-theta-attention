@@ -10,7 +10,7 @@ Testing was done for the LLaMA models on [arc_challenge/arc_easy](https://huggin
 conda create python=3.9.12 --prefix ./topksandbox
 conda activate $(pwd)/topksandbox
 
-# Install the lm-eval harness repo and enable unsandboxed evaluation of LLM-generated python programs
+# Install human_eval repo and enable unsandboxed evaluation of LLM-generated python programs
 git clone https://github.com/openai/human-eval.git
 pushd human-eval
 sed -i 's/^#\s*\(.*exec(check_program, exec_globals).*\)/\                        exec(check_program, exec_globals)/'  human_eval/execution.py
@@ -19,7 +19,7 @@ sed -i 's/^.*assert len(completion_id) == len(problems), "Some problems are not 
 pip install -e .
 popd
 
-# Install the human_eval repo and patch it with the calibration tasks for Hellaswag, Arc_Challenge, and Arch_Easy
+# Install the the lm-eval harness repo and patch it with the calibration tasks for Hellaswag, Arc_Challenge, and Arch_Easy
 git clone https://github.com/EleutherAI/lm-evaluation-harness.git
 pushd lm-evaluation-harness
 git checkout e5dfd0304efa6668bcf61aa3eb22ce8abe337eaf
