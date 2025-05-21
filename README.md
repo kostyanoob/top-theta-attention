@@ -1,11 +1,11 @@
 Codebase to test **Top-k Attention** and **Top-theta Attention** on Large Language Models using the lm-eval-harness [1] framework, and text generation tasks including HumanEval  [2] and LongBench [3]
 
 
-Testing was done for the LLaMA models on [arc_challenge/arc_easy](https://huggingface.co/datasets/allenai/ai2_arc)[/hellaswag](https://rowanzellers.com/hellaswag)[/medmcqa](https://github.com/medmcqa/medmcqa) datasets for Q&A evaluation (prefill-only tasks) and on [humaneval](https://github.com/openai/human-eval)[/longbench](hhttps://github.com/THUDM/LongBench) datasets (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
+Testing was done for the LLaMA models on [arc_challenge/arc_easy](https://huggingface.co/datasets/allenai/ai2_arc)[/hellaswag](https://rowanzellers.com/hellaswag)[/medmcqa](https://github.com/medmcqa/medmcqa) datasets for Q&A evaluation (prefill-only tasks) and on [humaneval](https://github.com/openai/human-eval)[/longbench](https://github.com/THUDM/LongBench) datasets (prefill + generative decoding). For detailed tested variants, refer to [reproduce.md](reproduce.md).
 
 <p align="center">
-<img src="images/QA_results.png" width="70%" align="center">
-<img src="images/Generative_results.png" width="70%"  align="center">
+<img src="images/QA_results.png" width="85%" align="center">
+<img src="images/Generative_results.png" width="85%"  align="center">
 </p>
 
 
