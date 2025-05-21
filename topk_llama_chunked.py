@@ -1,12 +1,103 @@
 import itertools
 import pdb
+from typing import Tuple
 import numpy as np
 import torch
 from transformers.models.llama.modeling_llama import *
 import torch.nn.functional as F
 import math
 
+def memory_efficient_sum_exp_attn_minus_max(attn: torch.Tensor,
+                                            max_attn_per_row: torch.Tensor,
+                                            dtype: torch.dtype):
+    """
+    for every batch, head, attention_row compute the sum of: exponentiated attention row minus row's max.
+    
+    output_tensor[b,h,row] = sum( exp(attn[b,h,row,:] - max_attn_per_row(exp(attn[b,h,row,:])) )
 
+    Args:
+        attn: float tensor of shape [B, N, q_chunk_len, kv_seq_len] - pre-softmax attention scores
+        max_attn_per_row: float tensor of shape [B, N, q_chunk_len] - per-attention-row maximum values of the pre-softmax-attension scores
+        dtype: numeric data type in which the exponentiation should be taking place: recommended: torch.float32
+
+    Return:
+        tensor of shape [B, N, q_chunk_len] - with the sums of exponentiated 
+        rows of <attn> (with maxiums subtracted).
+    """
+    B, N, q_chunk_len, kv_seq_len = attn.shape
+    if q_chunk_len * kv_seq_len < 200 * 42_000:  # arbitrary limit based on llama3.1-8B on 48GB GPU
+        # one-shot torch operation
+        output_tensor = memory_efficient_sum_reduction(torch.exp(attn.to(dtype=dtype) - max_attn_per_row.unsqueeze(-1).to(dtype=dtype)), dim=-1)
+    else:
+        # iterative chunked reduction (chunk again across the q_len dimension)
+        q_chunk_secondary_len = max(int(q_chunk_len / 10), 1)
+        output_tensor = torch.zeros(B, N, q_chunk_len, dtype=dtype, device=attn.device)
+        for start_idx in range(0, q_chunk_len, q_chunk_secondary_len):
+            end_idx = min(start_idx + q_chunk_secondary_len, q_chunk_len)
+            output_tensor[:,:,start_idx:end_idx] = memory_efficient_sum_reduction(torch.exp(attn[:,:,start_idx:end_idx,:].to(dtype=dtype) - max_attn_per_row[:,:,start_idx:end_idx].unsqueeze(-1).to(dtype=dtype)), dim=-1)
+    return output_tensor
+
+
+def memory_efficient_sum_reduction(input_tensor:torch.Tensor, dim:Tuple) -> torch.Tensor:
+    """
+    reduce the input tensor with shape (B, N, q_chunk_len, kv_seq_len) across the dimensions <dim>
+    return tensor of interger counters:
+      if dim = (2,3) return tensor of shape (B, N)
+      if dim = (2) return tensor of shape (B, N, kv_seq_len)
+      if dim = (3) return tensor of shape (B, N, q_chunk_len)
+    """
+    if len(input_tensor.shape) != 4:
+        raise ValueError(f"memory_efficient_sum_reduction() supports only input tensor with shape of length 4.")
+
+    B, N, q_chunk_len, kv_seq_len = input_tensor.shape
+    
+    if q_chunk_len * kv_seq_len < 200 * 42_000:  # arbitrary limit based on llama3.1-8B on 48GB GPU
+        # one-shot torch reduction
+        output_tensor = input_tensor.sum(dim=dim)
+    elif dim in [(2, 3), (-2, -1)]:
+        # iterative chunked reduction (chunk again across the q_len dimension)
+        q_chunk_secondary_len = max(int(q_chunk_len / 10), 1)
+        output_tensor = torch.zeros(B, N, device=input_tensor.device)
+        for start_idx in range(0, q_chunk_len, q_chunk_secondary_len):
+            end_idx = min(start_idx + q_chunk_secondary_len, q_chunk_len)
+            output_tensor += input_tensor[:, :, start_idx:end_idx, :].sum(dim=dim)
+    elif dim in [2, -2, (2,), (-2,)]:
+        # iterative chunked reduction (chunk again across the q_len dimension)   (B, N, q_chunk_len, kv_seq_len) --> (B, N, kv_seq_len)
+        q_chunk_secondary_len = max(int(q_chunk_len / 10), 1)
+        output_tensor = torch.zeros(B, N, kv_seq_len, device=input_tensor.device)
+        for start_idx in range(0, q_chunk_len, q_chunk_secondary_len):
+            end_idx = min(start_idx + q_chunk_secondary_len, q_chunk_len)
+            output_tensor += input_tensor[:, :, start_idx:end_idx, :].sum(dim=dim)            
+    elif dim in [3, -1, (3,), (-1,),]:
+        # iterative chunked reduction (chunk again across the q_len dimension)  (B, N, q_chunk_len, kv_seq_len) --> (B, N, q_chunk_len)
+        q_chunk_secondary_len = max(int(q_chunk_len / 10), 1)
+        output_tensor = torch.zeros(B, N, q_chunk_len, device=input_tensor.device)
+        for start_idx in range(0, q_chunk_len, q_chunk_secondary_len):
+            end_idx = min(start_idx + q_chunk_secondary_len, q_chunk_len)
+            output_tensor[:, :, start_idx:end_idx] = input_tensor[:, :, start_idx:end_idx, :].sum(dim=dim)
+    else:
+        raise ValueError(f"Unsupported dimesnsion argument for memory_efficient_sum_reduction. Use either dim=(2,3), or dim=2, or dim=3.")
+
+    return output_tensor   
+
+def lower_triangular_slice(start_row_idx, end_row_idx, num_cols, device) -> torch.Tensor:
+    """
+    Materialize a horizontal slice of a lower triangular boolean mask.
+
+    Args:
+        start_row_idx (int): Starting row index of the slice
+        end_row_idx (int): Last number of row to include in putput slice (exclusive)
+        num_cols (int): Size of the full square matrix (n x n).
+
+    Returns:
+        torch.Tensor: A boolean tensor of shape (chunk_max_size, num_cols) representing the slice.
+    """
+    # Create a range for the row indices of the slice
+    row_indices = torch.arange(start_row_idx, min(end_row_idx , num_cols)).unsqueeze(1)  # Shape: (slice_size, 1)
+    col_indices = torch.arange(num_cols).unsqueeze(0)  # Shape: (1, num_cols)
+    # Generate the lower triangular mask for the slice
+    mask_slice = row_indices >= col_indices  # Broadcasting to compare row and column indices
+    return mask_slice.to(device)
 
 def aggregate_threshold_list(row_th_lst:List[float], calib_add_sigma=0.0) -> float:
     """
@@ -28,7 +119,7 @@ class TopK_LLamaAttention(LlamaAttention):
         except:
             super().__init__(config)
         self.to(config.torch_dtype) # Note in theory the super class should instantiate the module in torch_dtype. Might be obsolote for newer versions of transformers
-
+        self.max_q_chunk_size = 1536  # for chunked prefill - this will be the longest seq-len dimension processed at a time while computing Softmax(QK^T)V
         self.K = -1            # K value
         self.id = layer_idx           # Layer id
         self.calibrate = False # Enable calibration mode (could be turned off by the obect itself once it processes the desired number of calibration samples)
@@ -51,7 +142,7 @@ class TopK_LLamaAttention(LlamaAttention):
         self.reduce_gpu_mem = reduce_gpu_mem
         self.products_dir_path = products_dir_path  # per-layer thresholds from the calibration are written here
         self.dump_qkv = False      # dump per-layer qKV matrices. Careful: they don't distinct different samples, if the samples will have same sequence length - they will be overwritten by hte latest one having the same seqlen
-
+        self.dump_stats_set = set() # set of stats to dump
         self.sdc = 'none'           # sdc = softmax denominatr compensation
         self.sdc_scale = 0.0        # coefficient that mul;iplies the sdc term
         self.sdc_list = []          # sdc terms per calibration sample (for sdc='offline-calibrated' only)
@@ -111,39 +202,63 @@ class TopK_LLamaAttention(LlamaAttention):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         # k = [bsz, num_heads=num_key_value_groups*num_key_value_heads, q_len, head_dim]      
         # v = [bsz, num_heads=num_key_value_groups*num_key_value_heads, q_len, head_dim]
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
         
-        #-----------------------------Top-K * TH Implementation ----------------------------------------
-        if self.placement == 'pre-softmax':
-            max_attention_scores = attn_weights.max(dim=-1)[0].to(dtype=torch.float32) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # DO THIS BEFORE SOFTMAX and only if SDC compensation is necessary, otherwise skip this computation
-            attn_weights, attn_scores_unselected, attn_top_mask = self.topk_or_threshold(attn_weights, query_states, kv_seq_len)
-            existing_denoms = (attn_weights.to(dtype=torch.float32) - max_attention_scores.unsqueeze(-1)).exp().sum(dim=-1) if max_attention_scores is not None else None  # DO THIS BEFORE SOFTMAX compute the per-row denominators of the softmax, considering only the top (selected) elements. Do this step only if SDC compensation is necessary, otherwise skip this computation
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
-            attn_weights = self.softmax_denominator_compensation(attn_weights, attn_scores_unselected, attn_top_mask, existing_denoms, max_attention_scores, dtype=torch.float32).to(query_states.dtype)
-        elif self.placement == 'post-softmax':
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights, _, _ = self.topk_or_threshold(attn_weights, query_states, kv_seq_len)
-        elif self.placement == 'none': 
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)     
-            self.dump_stats_attn_elem_and_v_row_full([bsz, self.num_heads, q_len, kv_seq_len], "generative_decoding" if q_len==1 else "prefill")
-        else: 
-            raise ValueError(f'Illegal topk placement encountered: "{self.placement}"')
-        #-----------------------------------------------------------------------------------------
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Initialize attention outputs
+        attn_output = torch.zeros(
+            (bsz, self.num_heads, q_len, self.head_dim), dtype=query_states.dtype, device=query_states.device
+        )
+        attn_weights = None if not output_attentions else [] # TODO change this list append to appending across the q_len dimension
+        inference_phase = "generative_decoding" if q_len==1 else "prefill"
 
-        if self.vmc:
-            attn_output = self.v_mean_compensation(attn_output, attn_weights, value_states)
+        # Process in chunks along q_len - each time process "q_chunk_len" rows of attention, and output
+        if kv_seq_len < 32000:
+            max_q_chunk_size_effective = self.max_q_chunk_size
+        elif 32_000 <= kv_seq_len < 42_000:
+            max_q_chunk_size_effective = 800 if self.mode not in [0,1] else 400 # radically reduce the chunk size to allow larger KV caches
+        else:
+            max_q_chunk_size_effective = 400 if self.mode not in [0,1] else 200 # radically reduce the chunk size to allow larger KV caches
+        for start_idx in range(0, q_len, max_q_chunk_size_effective):
+            end_idx = min(start_idx + max_q_chunk_size_effective, q_len)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
+            # Slice the query states for the current chunk
+            query_states_chunk = query_states[:, :, start_idx:end_idx, :]
+
+            # Compute attention weights for the chunk
+            attn_weights_chunk = torch.matmul(query_states_chunk, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            if attention_mask is not None:
+                causal_mask = attention_mask[:, :, start_idx:end_idx, :]
+                attn_weights_chunk = attn_weights_chunk + causal_mask
+
+            #-----------------------------Top-K * TH Implementation ----------------------------------------
+            if self.placement == 'pre-softmax':
+                max_attention_scores_chunk = attn_weights_chunk.max(dim=-1)[0].to(dtype=torch.float32) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # DO THIS BEFORE SOFTMAX and only if SDC compensation is necessary, otherwise skip this computation
+                attn_weights_chunk, attn_scores_unselected_chunk, attn_top_mask = self.topk_or_threshold(attn_weights_chunk, start_idx, end_idx)
+                existing_denoms_chunk = memory_efficient_sum_exp_attn_minus_max(attn_weights_chunk, max_attention_scores_chunk, dtype=torch.float32)  #if max_attention_scores_chunk is not None else None  # DO THIS BEFORE SOFTMAX compute the per-row denominators of the softmax, considering only the top (selected) elements. Do this step only if SDC compensation is necessary, otherwise skip this computation
+                attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32)
+                attn_weights_chunk = self.softmax_denominator_compensation(attn_weights_chunk, attn_scores_unselected_chunk, attn_top_mask, existing_denoms_chunk, max_attention_scores_chunk, start_idx, end_idx, inference_phase, dtype=torch.float32).to(query_states.dtype)
+            elif self.placement == 'post-softmax':
+                attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights_chunk, _, _ = self.topk_or_threshold(attn_weights_chunk, start_idx, end_idx)
+            elif self.placement == 'none': 
+                attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query_states.dtype)     
+                self.dump_stats_attn_elem_and_v_row_full(attn_weights_chunk.size(), inference_phase, start_idx, end_idx)
+            else: 
+                raise ValueError(f'Illegal topk placement encountered: "{self.placement}"')
+            #-----------------------------------------------------------------------------------------
+
+            # Accumulate attention weights if required
+            if output_attentions:
+                attn_weights.append(attn_weights_chunk)  # TODO change this list append to appending across the q_len dimension
+
+            # Compute attention output for the chunk
+            attn_output_chunk = torch.matmul(attn_weights_chunk, value_states)
+
+            if self.vmc:
+                attn_output_chunk = self.v_mean_compensation(attn_output_chunk, attn_weights_chunk, value_states, start_idx, end_idx)
+
+            # Store the output for the current chunk
+            attn_output[:, :, start_idx:end_idx, :] = attn_output_chunk
         
         if self.dump_qkv:
             self.dump_qkv_to_file(query_states, key_states, value_states)
@@ -247,9 +362,11 @@ class TopK_LLamaAttention(LlamaAttention):
         return torch.Tensor([[self.get_sdc_value(head_id, seq_len) for seq_len in range(seq_len_start,seq_len_end+1)] for head_id in range(head_start, head_end+1)])
 
     def v_mean_compensation(self, 
-                            attn_output: torch.Tensor, 
-                            attn_weights: torch.Tensor, 
-                            value_states: torch.Tensor) -> torch.Tensor:
+                            attn_output_chunk: torch.Tensor, 
+                            attn_weights_chunk: torch.Tensor, 
+                            value_states: torch.Tensor,
+                            start_idx: int, 
+                            end_idx: int) -> torch.Tensor:
         """
         Apply V-mean compensation on the attn_output matrix. This compensation
         affects only when the attn_weights has rows (3rd dimension) that sum up
@@ -257,34 +374,46 @@ class TopK_LLamaAttention(LlamaAttention):
         This compensation is aimed to approximately add these missing V-rows back.
 
         Args:
-            attn_output:  product of the softmax output (attn_weights)
+            attn_output_chunk:  product of the softmax output (attn_weights_chunk)
                           multiplied by the V matrix. 
-                          shape: (BSZ, NHEADS, Q_LEN, HEAD_DIM)
-            attn_weights: tensor containing the softmax output, aka attention
+                          shape: (BSZ, NHEADS, q_chunk_len, HEAD_DIM)
+            attn_weights_chunk: tensor containing the softmax output, aka attention
                           scores, aka attention probabilities.
-                          shape: (BSZ, NHEADS, Q_LEN, KV_SEQ_LEN)
+                          shape: (BSZ, NHEADS, q_chunk_len, KV_SEQ_LEN)
             value_states: the value matrix
                           shape: (BSZ, NHEADS, KV_SEQ_LEN, HEAD_DIM)
-        
+            start_idx:    first row index of the current attention chunk (inclusive)
+            end_idx:      last index of the current attention chunk (exclusive)
         Returns:
           attention output tensor of the same shape as before, but with every row 
           added a special HEAD_DIM-long compensation vector
         """
-        BSZ, NHEADS, q_len, HEAD_DIM = attn_output.shape
+        BSZ, NHEADS, q_chunk_len, HEAD_DIM = attn_output_chunk.shape
         BSZ, NHEADS, kv_seq_len, HEAD_DIM = value_states.shape
-        preserved_probability_mass = attn_weights.sum(dim=-1)  # sum up each row -> [BSZ, NHEADS, kv_seq_len]
+        
+        preserved_probability_mass = memory_efficient_sum_reduction(attn_weights_chunk, dim=-1)  # sum up each row -> [BSZ, NHEADS, q_chunk_len]
         lost_probability_mass = 1 - preserved_probability_mass  # take the complementary to represent the probability mass that was removed by the sparsification (topk/th) -> [BSZ, NHEADS, kv_seq_len]
         v_mean_rows = value_states.cumsum(dim=2) / torch.arange(start=1, end=kv_seq_len + 1, step=1, device=value_states.device).unsqueeze(0).unsqueeze(0).unsqueeze(-1)  # for every row r in [0,kv_seq_len-1] compute its causal running v_mean[r,:] vector as an average across V[0:r,:].mean(dim=0) -- > [BSZ, NHEADS, kv_seq_len, HEAD_DIM]
-        attn_output = attn_output + lost_probability_mass.unsqueeze(-1) * v_mean_rows[:,:,-q_len:,:]  # [BSZ, NHEADS, q_len, HEAD_DIM] + [BSZ, NHEADS, q_len, unsqueezed] * [BSZ, NHEADS, q_len, HEAD_DIM]
-        return attn_output
+        
+        if q_chunk_len == 1:  # generative_decoding - use last mean_v row
+            v_mean_rows_chunk = v_mean_rows[:,:,-1:,:]
+        else:  # chunked prefill - need to carefully pick the correct mean v_rows for compensation
+            assert(0 <= start_idx < end_idx <= kv_seq_len)
+            v_mean_rows_chunk = v_mean_rows[:,:,start_idx:end_idx,:]
+
+        attn_output_chunk = attn_output_chunk + lost_probability_mass.unsqueeze(-1) * v_mean_rows_chunk  # [BSZ, NHEADS, q_chunk_len, HEAD_DIM] + [BSZ, NHEADS, q_chunk_len, unsqueezed] * [BSZ, NHEADS, q_chunk_len, HEAD_DIM]
+        return attn_output_chunk
 
     def softmax_denominator_compensation(self, 
-                                         attn_weights: torch.Tensor, 
-                                         attn_scores_unselected: torch.Tensor, 
+                                         attn_weights_chunk: torch.Tensor, 
+                                         attn_scores_unselected_chunk: torch.Tensor, 
                                          attn_top_mask: torch.Tensor,
-                                         existing_denoms: torch.Tensor,
-                                         max_attention_scores: torch.Tensor,
-                                         dtype=torch.float32
+                                         existing_denoms_chunk: torch.Tensor,
+                                         max_attention_scores_chunk: torch.Tensor,
+                                         start_idx:int,
+                                         end_idx:int,
+                                         inference_phase:str,
+                                         dtype=torch.float32,
                                          ) -> torch.Tensor:
         """
         Apply softmax denominator compensaton on the attention weights tensor,
@@ -298,83 +427,100 @@ class TopK_LLamaAttention(LlamaAttention):
         Anyway, only attn_weights's rows > K are compensated!
 
         Args:
-          attn_weights - attention tensor (after the softmax was applied)
-                         Shape: (BATCH_SIZE, NHEADS, SEQ_LEN, SEQ_LEN)
-          attn_scores_unselected - attention tensor (before the softmax was applied)
+          attn_weights_chunk - attention tensor (after the softmax was applied)
+                         Shape: (BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len)
+          attn_scores_unselected_chunk - attention tensor (before the softmax was applied)
                          with -inf in all the places which 
                          were chosen to be kept by topk/thinfinity
+                         Shape: (BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len)
           attn_top_mask - boolean mask with True in places that were selected 
-                         to keep.
-                         or topk. Shape: (BATCH_SIZE, NHEADS, SEQ_LEN)
-          existing_denoms - sum of e^{xi-max(x)} (before softmax) per every row
+                         to keep. (BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len)
+                         or topk. Shape: (BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len)
+          existing_denoms_chunk - sum of e^{xi-max(x)} (before softmax) per every row
                          of the attetnion matrix *after-top-k/th* but *before-softmax*
-                         Shape: (BATCH_SIZE, NHEADS, SEQ_LEN)
-          max_attention_scores -  per attention row (per head ber batch dim)
+                         Shape: (BATCH_SIZE, NHEADS, q_chunk_len)
+          max_attention_scores_chunk -  per attention row (per head per batch dim)
                          maximum of the elements (must be computed before the 
                          softmax. i.e. on the attention scores, aka logits) 
-                         Shape: (BATCH_SIZE, NHEADS, SEQ_LEN)
-          dtype -        data type, in which to process the compensation
+                         Shape: (BATCH_SIZE, NHEADS, q_chunk_len)
+          start_idx     - index of the first attention row being processed (inclusive)
+          end_idx       - index of the last attention row being processed (exclusive)
+          inference_phase - str, either "generative_decoding" or "prefill"
+          dtype         - data type, in which to process the compensation
         Returns:
           attention matrix of the same shape as before, but with the attention 
           scores renormalized by a larger denominator 
         """
-        # TODO: verify that SEQ_LEN is indeed the kv_seq_len at generative decoding and not 1
-        BATCH_SIZE, NHEADS, SEQ_LEN, _ = attn_weights.size()
+        BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len = attn_weights_chunk.size()
         K = self.K[self.id] 
 
         # no compensation required
-        if self.sdc == 'none' or self.sdc_scale == 0.0 or SEQ_LEN <= K or attn_top_mask is None:
-            return attn_weights
+        if self.sdc == 'none' or self.sdc_scale == 0.0 or kv_seq_len <= K or attn_top_mask is None or (inference_phase == "prefill" and end_idx < K):
+            return attn_weights_chunk
 
+        # determine r_chunk - the first attn row (within the attention chunk) tthat the top-k or top-theta were applied from, hence an SDC is required there
+        if inference_phase=="generative_decoding":
+            r_chunk = 0 # there is only 1 row duing decoding, regardless of chunk size
+        else:
+            if K < start_idx:  # end_idx <= K: apply top-theta to the entire chunk
+                r_chunk = 0
+            elif start_idx <= K < end_idx:  # top-theta thresholding needs to be carefully applied from a very specific row in the attention matrix chunk
+                r_chunk = K - start_idx
+            else: 
+                assert(False and "Shouldn't happen due to the above condition of K <= end_idx. The chunk's entire range of rows [start_idx, end_id) is below K, hence no Top-k/theta should take place")
+            
         if self.sdc == 'exact':
-            assert ((BATCH_SIZE, NHEADS, SEQ_LEN, SEQ_LEN) == attn_scores_unselected.size())
-            assert ((BATCH_SIZE, NHEADS, SEQ_LEN) == existing_denoms.size())
-            assert ((BATCH_SIZE, NHEADS, SEQ_LEN) == max_attention_scores.size())
-            missing_denominator_term = torch.sum(torch.exp(attn_scores_unselected[:,:,K:,:].to(dtype=dtype) - max_attention_scores[:,:,K:].unsqueeze(-1).to(dtype=dtype)), dim=-1)
-            new_denom = existing_denoms[:,:,K:] + self.sdc_scale * missing_denominator_term
-            attn_weights[:,:,K:,:] = attn_weights[:,:,K:,:].mul(existing_denoms[:,:,K:].unsqueeze(-1)).div(new_denom.unsqueeze(-1))
+            assert ((BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len) == attn_scores_unselected_chunk.size())
+            assert ((BATCH_SIZE, NHEADS, q_chunk_len) == existing_denoms_chunk.size())
+            assert ((BATCH_SIZE, NHEADS, q_chunk_len) == max_attention_scores_chunk.size())
+            missing_denominator_term = memory_efficient_sum_exp_attn_minus_max(attn_scores_unselected_chunk[:,:,r_chunk:,:],
+                                                                               max_attention_scores_chunk[:,:,r_chunk:],
+                                                                               dtype)
+            new_denom = existing_denoms_chunk[:,:,r_chunk:] + self.sdc_scale * missing_denominator_term
+            attn_weights_chunk[:,:,r_chunk:,:].mul_(existing_denoms_chunk[:,:,r_chunk:].unsqueeze(-1))
+            attn_weights_chunk[:,:,r_chunk:,:].div_(new_denom.unsqueeze(-1))
         elif self.sdc == 'exp-threshold':
             assert self.mode == 0, "exp-threshold compensation is only applicable in mode=0 (thresholding)"
             if not self.calibrate:
-                assert ((BATCH_SIZE, NHEADS, SEQ_LEN, SEQ_LEN) == attn_top_mask.size())
-                assert ((BATCH_SIZE, NHEADS, SEQ_LEN) == max_attention_scores.size())
+                assert ((BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len) == attn_top_mask.size())
+                assert ((BATCH_SIZE, NHEADS, q_chunk_len) == max_attention_scores_chunk.size())
 
-                num_selected_elements = attn_top_mask.sum(dim=-1)
-                num_unselected_elements = (SEQ_LEN - num_selected_elements)
+                num_selected_elements = memory_efficient_sum_reduction(attn_top_mask, dim=-1)
+                num_unselected_elements = (kv_seq_len - num_selected_elements)
                 
                 # look-up the SEQ_LEN-K thresholds from the closest sequence length from calibrated set. 
-                per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, K + 1, SEQ_LEN)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row thresholds 
-                per_head_row_thresholds = per_head_row_thresholds.to(device=attn_weights.device, dtype=attn_weights.dtype)
+                per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, max(start_idx, K), end_idx-1)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row thresholds 
+                per_head_row_thresholds = per_head_row_thresholds.to(device=attn_weights_chunk.device, dtype=attn_weights_chunk.dtype)
 
                 # Renormalize softmax score (e^a_i/existing_denoms[row]) by multiplying
                 # it by "existing_denoms[row]/(existing_denoms[row] + sdc_scale * num_unselected[row] * e^(th - max(a))"
-                missing_denominator_term = num_unselected_elements[:,:,K:] * torch.exp(per_head_row_thresholds.unsqueeze(0) - max_attention_scores[:,:,K:].to(dtype=existing_denoms.dtype))
-                new_denom = existing_denoms[:,:,K:] + self.sdc_scale * missing_denominator_term
-                attn_weights[:,:,K:,:] = attn_weights[:,:,K:,:].mul(existing_denoms[:,:,K:].unsqueeze(-1)).div(new_denom.unsqueeze(-1))
+                missing_denominator_term = num_unselected_elements[:,:,r_chunk:] * torch.exp(per_head_row_thresholds.unsqueeze(0) - max_attention_scores_chunk[:,:,r_chunk:].to(dtype=existing_denoms_chunk.dtype))
+                new_denom = existing_denoms_chunk[:,:,r_chunk:] + self.sdc_scale * missing_denominator_term
+                attn_weights_chunk[:,:,r_chunk:,:] = attn_weights_chunk[:,:,r_chunk:,:].mul(existing_denoms_chunk[:,:,r_chunk:].unsqueeze(-1)).div(new_denom.unsqueeze(-1))
 
         elif self.sdc == 'offline-calibrated':
             assert self.mode in {0,1}, "offline-calibrated compensation is available in mode 0 (thresholding) and 1 (topk)"
             if not self.calibrate:
 
                 # look-up per-row missing denominator terms from the calibrated dictionary
-                missing_denominator_terms = self.get_sdc_tensor(0, NHEADS - 1, K + 1, SEQ_LEN)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row calibrated sdc terms 
-                missing_denominator_terms = missing_denominator_terms.to(dtype=attn_weights.dtype, device=attn_weights.device)
+                missing_denominator_terms = self.get_sdc_tensor(0, NHEADS - 1, max(start_idx, K), end_idx-1)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row calibrated sdc terms 
+                missing_denominator_terms = missing_denominator_terms.to(dtype=attn_weights_chunk.dtype, device=attn_weights_chunk.device)
 
                 # Renormalize softmax score of row vector a "e^(a_i-max(a))/existing_denoms[row]" by multiplying
                 # it by "existing_denoms[row]/(existing_denoms[row] + sdc_scale * missing_denominator_term_from_calibration[row])"
-                new_denom = existing_denoms[:,:,K:] + self.sdc_scale * missing_denominator_terms.unsqueeze(0).unsqueeze(0)
-                attn_weights[:,:,K:,:]  = attn_weights[:,:,K:,:] .mul(existing_denoms[:,:,K:].unsqueeze(-1)).div(new_denom.unsqueeze(-1))
+                new_denom = existing_denoms_chunk[:,:,r_chunk:] + self.sdc_scale * missing_denominator_terms.unsqueeze(0).unsqueeze(0)
+                attn_weights_chunk[:,:,r_chunk:,:]  = attn_weights_chunk[:,:,r_chunk:,:] .mul(existing_denoms_chunk[:,:,r_chunk:].unsqueeze(-1)).div(new_denom.unsqueeze(-1))
 
         else:
             assert NotImplementedError(f"self.sdc compensation is not supported")
 
-        return attn_weights
+        return attn_weights_chunk
 
     def topk_or_threshold(
             self,
             attn_weights: torch.Tensor,
-            query_states: torch.Tensor, 
-            kv_seq_len: int,
+            start_idx: int,
+            end_idx: int            
         ) -> torch.Tensor:
         """
         apply the top-k or the thresholding (according to the self.mode) on 
@@ -383,15 +529,16 @@ class TopK_LLamaAttention(LlamaAttention):
         attention weight matrix)
 
         Arguments
-            attn_weights - Tensor of shape (bsz, self.num_heads, q_len, kv_seq_len).
-                           This is the primary input tensor to be processed.
-            query_states - Tensor of shape (bsz, self.num_heads, q_len, self.head_dim).
-                           Used only for shape and dtype information.
-            kv_seq_len   - Integer, normally equal to sequence length, used
-                           for logging.
+            attn_weights - "chunk of attention weights" 
+                           Tensor of shape (bsz, self.num_heads, q_chunk_len, kv_seq_len).
+                           This is the primary input tensor to be processed
+            start_idx    - Integer specifyng the first attention row id (inclusive) 
+                           that should be computed used for chunked prefill
+            end_idx      - Integer specifyng the last attention row id (excluisve) 
+                           that should be computed used for chunked prefill
 
         Returns: 3 tensors:
-                 1) the attn_weights tensor (bsz, self.num_heads, q_len, kv_seq_len) 
+                 1) the attn_weights tensor (bsz, self.num_heads, q_chunk_len, kv_seq_len) 
                  after the application of Top-k / thresholding.
                  2) attn_weights_unselected - the complementary tensor to attn_weights,
                     where the not selected weights are equal to original weight, whereas the
@@ -399,9 +546,10 @@ class TopK_LLamaAttention(LlamaAttention):
                  3) attn_top_mask - boolean mask signifying the elements that were selected
                  to be kept by topk/th. Will be None if self.sdc is 'none'
         """
-        BATCH_SIZE, NHEADS, q_len, DIM = query_states.size()
+        BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len = attn_weights.size()
+        assert (q_chunk_len == end_idx - start_idx)
         K = self.K[self.id] if isinstance(self.K, list) else self.K
-        inference_phase = "prefill" if q_len == kv_seq_len else "generative_decoding"
+        inference_phase = "generative_decoding" if q_chunk_len == 1 else "prefill"
         attn_scores_unselected = None
         attn_top_mask = None
     
@@ -424,74 +572,104 @@ class TopK_LLamaAttention(LlamaAttention):
             
             # ----- mode-0 Thresholding -----
             if self.mode == 0:
-                if (self.id == self.test_layer) or (self.test_layer is None):
-                    attn_top_mask = torch.full(attn_weights.size(), True, dtype=torch.bool, device=attn_weights.device)
-                    if inference_phase=="prefill":
-                        attn_top_mask = attn_top_mask.tril() # re-enforces causality
-                    attn_scores_unselected = torch.full_like(attn_weights, replacement_value) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # cancel allocation when no further use of this tensor will be made 
-                    if 0 < K < kv_seq_len:
-                        r = 0 if inference_phase=="generative_decoding" else K # first attn row to threshold from it until the last rows (dim=2) of attn_weights
-                        
-                        # look up for the claibrated per-attn-row (per-sequence-length) thresholds
-                        per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, max(kv_seq_len-q_len+1,K+1), kv_seq_len)  # [NHEADS, kv_seq_len-K] at prefill, [NHEADS,1] at generative decoding - a 2D matrix of per-head-per-row thresholds 
-                        per_head_row_thresholds = per_head_row_thresholds.to(device=attn_weights.device, dtype=attn_weights.dtype)
-                        
-                        # Apply threholding - set a bitmask of items to be kept (>th)
-                        attn_top_mask[:,:,r:,:] = torch.gt(attn_weights[:,:,r:,:], per_head_row_thresholds.unsqueeze(0).unsqueeze(-1))
 
-                        # capk - keep at most K last elements in every row
-                        if self.capk:
-                            cumsum = attn_top_mask[:,:,r:,:].cumsum(dim=-1)
-                            cumsum_rev = cumsum.max(dim=-1, keepdim=True)[0] - cumsum
-                            attn_top_mask[:,:,r:,:] = attn_top_mask[:,:,r:,:] & (cumsum_rev < K)
-                        
-                        if attn_scores_unselected is not None:
-                            attn_scores_unselected[:,:,r:,:] = torch.where(attn_top_mask[:,:,r:,:], replacement_value, attn_weights[:,:,r:,:])
-                        attn_weights[:,:,r:,:] = torch.where(attn_top_mask[:,:,r:,:], attn_weights[:,:,r:,:], replacement_value)
-                        buff_occupancy_topk_per_head = BATCH_SIZE * K if inference_phase=="generative_decoding" else BATCH_SIZE * (((1 + K) * K / 2) + ((kv_seq_len - K) * K))  # number of attention elements that the topk method would keep per attention head
+                # Initialize selection mask and unselected scores
+                if inference_phase=="prefill":
+                    attn_top_mask = lower_triangular_slice(start_idx, end_idx, kv_seq_len, device=attn_weights.device) 
+                    attn_top_mask = attn_top_mask.unsqueeze(0).repeat(BATCH_SIZE, 1, 1).unsqueeze(1).repeat(1, NHEADS, 1, 1)
+                else:
+                    attn_top_mask = torch.full(attn_weights.size(), True, dtype=torch.bool, device=attn_weights.device)
+                attn_scores_unselected = torch.full_like(attn_weights, replacement_value) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # cancel allocation when no further use of this tensor will be made 
+                
+                if 0 < K < kv_seq_len and (inference_phase != "prefill" or K <= end_idx):
+                    # look up for the claibrated per-attn-row (per-sequence-length) thresholds
+                    if inference_phase=="generative_decoding":
+                        per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, kv_seq_len, kv_seq_len)  # [NHEADS,1] at generative decoding - a 2D matrix of per-head-per-row thresholds 
                     else:
-                        buff_occupancy_topk_per_head = BATCH_SIZE * kv_seq_len if inference_phase=="generative_decoding" else BATCH_SIZE * ((1 + kv_seq_len) * kv_seq_len / 2)  # number of attention elements that the topk method would keep per attention head
+                        per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, max(start_idx, K), end_idx - 1)  # [NHEADS, chunk_size-K or chunk_size] at prefill- a 2D matrix of per-head-per-row thresholds 
+                    per_head_row_thresholds = per_head_row_thresholds.to(device=attn_weights.device, dtype=attn_weights.dtype)
+
+                    # determine r_chunk - the first attn row (within the attention chunk) to threshold from it until the last rows (dim=2) of attn_weights
+                    if inference_phase=="generative_decoding":
+                        r_chunk = 0 # there is only 1 row duing decoding, regardless of chunk size
+                    else:
+                        if K < start_idx:  # end_idx <= K: apply top-theta to the entire chunk
+                            r_chunk = 0
+                        elif start_idx <= K < end_idx:  # top-theta thresholding needs to be carefully applied from a very specific row in the attention matrix chunk
+                            r_chunk = K - start_idx
+                        else: 
+                            assert(False and "Shouldn't happen due to the above condition of K <= end_idx. The chunk's entire range of rows [start_idx, end_id) is below K, hence no Top-k/theta should take place")
+                        assert(q_chunk_len - r_chunk == per_head_row_thresholds.shape[-1])  # verify that enough per-seq-len thresholds were preapred for the relevant attention rows
+
+                    # Apply threholding - set a bitmask of items to be kept (>th)
+                    attn_top_mask[:,:,r_chunk:,:] = torch.gt(attn_weights[:,:,r_chunk:,:], per_head_row_thresholds.unsqueeze(0).unsqueeze(-1))
+
+                    # capk - keep at most K last elements in every row
+                    if self.capk:
+                        cumsum = attn_top_mask[:,:,r_chunk:,:].cumsum(dim=-1)
+                        cumsum_rev = cumsum.max(dim=-1, keepdim=True)[0] - cumsum
+                        attn_top_mask[:,:,r_chunk:,:] = attn_top_mask[:,:,r_chunk:,:] & (cumsum_rev < K)
                     
-                    # Collect relative (to topk method) number of attention 
-                    # elements that survived the thresholding.
-                    # buff_occupancy_relative should be ~ 1 for good thresholding.
-                    buff_occupancy_total_per_head = attn_top_mask.sum(dim=(2,3))
-                    buff_occupancy_relative_per_head = buff_occupancy_total_per_head / buff_occupancy_topk_per_head
-                    with open(f"{self.products_dir_path}/layer{self.id}.txt",'a') as f:
-                        for b_, h_ in itertools.product(range(BATCH_SIZE), range(NHEADS)):
-                            f.write(f'L{self.id}_H{h_}:{kv_seq_len} {K} {inference_phase} {buff_occupancy_relative_per_head[b_, h_]}\n')
+                    if attn_scores_unselected is not None:
+                        attn_scores_unselected[:,:,r_chunk:,:] = torch.where(attn_top_mask[:,:,r_chunk:,:], replacement_value, attn_weights[:,:,r_chunk:,:])
+                    attn_weights[:,:,r_chunk:,:] = torch.where(attn_top_mask[:,:,r_chunk:,:], attn_weights[:,:,r_chunk:,:], replacement_value)
+               
+                
+                # Collect relative (to topk method) number of attention 
+                # elements that survived the thresholding.
+                # buff_occupancy_relative should be ~ 1 for good thresholding.
+                buff_occupancy_topk_per_head = BATCH_SIZE * self.compute_buff_occupancy_topk_per_head(inference_phase, K, kv_seq_len, start_idx, end_idx)
+                buff_occupancy_total_per_head = memory_efficient_sum_reduction(attn_top_mask, dim=(2,3))
+                buff_occupancy_relative_per_head = buff_occupancy_total_per_head / buff_occupancy_topk_per_head
+                with open(f"{self.products_dir_path}/layer{self.id}.txt",'a') as f:
+                    for b_, h_ in itertools.product(range(BATCH_SIZE), range(NHEADS)):
+                        f.write(f'L{self.id}_H{h_}:{kv_seq_len} {K} {inference_phase} {buff_occupancy_relative_per_head[b_, h_]}\n')
             
             # ----- mode-1 TopK -----               
             if self.mode == 1:
-                if (self.id == self.test_layer) or (self.test_layer is None):
+                # Initialize selection mask and unselected scores
+                if inference_phase=="prefill":
+                    attn_top_mask = lower_triangular_slice(start_idx, end_idx, kv_seq_len, device=attn_weights.device) 
+                    attn_top_mask = attn_top_mask.unsqueeze(0).repeat(BATCH_SIZE, 1, 1).unsqueeze(1).repeat(1, NHEADS, 1, 1)
+                else:
                     attn_top_mask = torch.full(attn_weights.size(), True, dtype=torch.bool, device=attn_weights.device)
-                    if inference_phase=="prefill":
-                        attn_top_mask = attn_top_mask.tril() # re-enforces causality
-                    attn_scores_unselected = torch.full_like(attn_weights, replacement_value) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # cancel allocation when no further use of this tensor will be made 
-                    if 0 < K < kv_seq_len:
-                        # Find Top-k elements per row in attention rows [K, K+1,...]:
-                        r = 0 if inference_phase=="generative_decoding" else K # first attn row to apply top-k from it until the last rows (dim=2) of attn_weights
-                        vals, idxs = attn_weights[:,:,r:,:].topk(K, dim=-1)
-                        attn_top_mask[:,:,r:,:].fill_(False).scatter_(-1, idxs, True)   
-                        if attn_scores_unselected is not None:
-                            attn_scores_unselected[:,:,r:,:] = torch.where(attn_top_mask[:,:,r:,:], replacement_value, attn_weights[:,:,r:,:])
-                        attn_weights[:,:,r:,:] = torch.where(attn_top_mask[:,:,r:,:], attn_weights[:,:,r:,:], replacement_value)
+                attn_scores_unselected = torch.full_like(attn_weights, replacement_value) if self.sdc != 'none' and self.sdc_scale > 0.0 else None  # cancel allocation when no further use of this tensor will be made 
+                if 0 < K < kv_seq_len and (inference_phase != "prefill" or K <= end_idx):
+                    # Find Top-k elements per row in attention rows [K, K+1,...]:
+                    # determine the first attn row (within the attention chunk) to apply top-k from it until the last rows (dim=2) of attn_weights
+                    if inference_phase=="generative_decoding":
+                        r_chunk = 0 # there is only 1 row during decoding, regardless of chunk size
+                    else:
+                        if K < start_idx:  # end_idx <= K: apply top-theta to the entire chunk
+                            r_chunk = 0
+                        elif start_idx <= K < end_idx:  # top-theta thresholding needs to be carefully applied from a very specific row in the attention matrix chunk
+                            r_chunk = K - start_idx
+                        else: 
+                            assert(False and "Shouldn't happen due to the above condition of K <= end_idx. The chunk's entire range of rows [start_idx, end_id) is below K, hence no Top-k/theta should take place")
+                        # r_chunk = 0 if start_idx > K else K 
+
+                    vals, idxs = attn_weights[:,:,r_chunk:,:].topk(K, dim=-1)
+                    attn_top_mask[:,:,r_chunk:,:].fill_(False).scatter_(-1, idxs, True)   
+                    if attn_scores_unselected is not None:
+                        attn_scores_unselected[:,:,r_chunk:,:] = torch.where(attn_top_mask[:,:,r_chunk:,:], replacement_value, attn_weights[:,:,r_chunk:,:])
+                    attn_weights[:,:,r_chunk:,:] = torch.where(attn_top_mask[:,:,r_chunk:,:], attn_weights[:,:,r_chunk:,:], replacement_value)
 
             # Write statistics - number of kept attention elements and number of reuqired V rows
             if not self.calibration_phase: # double check that we are not in calibration sample (can happen after the prefill phase of the last calibration token is done)
                 if attn_top_mask is None:
-                    self.dump_stats_attn_elem_and_v_row_full([BATCH_SIZE, NHEADS, q_len, kv_seq_len], inference_phase)
+                    self.dump_stats_attn_elem_and_v_row_full([BATCH_SIZE, NHEADS, q_chunk_len, kv_seq_len], inference_phase, start_idx, end_idx)
                 else:
-                    self.dump_stats_attn_elem_and_v_row_from_mask(attn_top_mask, inference_phase)
+                    self.dump_stats_attn_elem_and_v_row_from_mask(attn_top_mask, inference_phase, start_idx, end_idx)
                     
             if attn_scores_unselected is None:
                 attn_top_mask = None
 
         else:
             # ----- Performing Calibration -----
+            assert(False and "TODO: verify the entire calibration after we introduced chunked prefill")
             sampled_row_th_rowids = []
             assert(self.num_calib_requests != 0), f"number of calibration requests was not set"
-            r = 0 if inference_phase=="generative_decoding" else K # first attn row to apply thresholding/topk from it until the last rows (dim=2) of attn_weights
+            r_chunk = 0 if inference_phase=="generative_decoding" else K # first attn row to apply thresholding/topk from it until the last rows (dim=2) of attn_weights
             
             if self.mode == 0 and 0 < K < kv_seq_len:
                 # -- calibration of thresholds for top-th --
@@ -501,12 +679,12 @@ class TopK_LLamaAttention(LlamaAttention):
                 if self.reduce_gpu_mem:
                     # chunked (several heads per chunk) quantile computation on gpu to keep the memory requirements low
                     quant_chunks = []
-                    for attn_heads_chunk in torch.tensor_split(attn_weights[:,:,r:,:], 4, dim=1):
+                    for attn_heads_chunk in torch.tensor_split(attn_weights[:,:,r_chunk:,:], 4, dim=1):
                         quant_chunk = torch.quantile(attn_heads_chunk.float(), 1 - K / kv_seq_len , dim=3, interpolation='lower')  # quantile() requires the input tensor dtype to be either float or double
                         quant_chunks.append(quant_chunk)
                     quant = torch.cat(quant_chunks, dim=1) 
                 else:
-                    quant = torch.quantile(attn_weights[:,:,r:,:].float(), 1 - K / kv_seq_len , dim=3, interpolation='lower')  
+                    quant = torch.quantile(attn_weights[:,:,r_chunk:,:].float(), 1 - K / kv_seq_len , dim=3, interpolation='lower')  
                 # quant tensor (NUM_BATCH_SIZE, NHEADS, kv_seq_len)
                 # contains a threshold per row of attention matrix (per head per batch example) 
 
@@ -514,7 +692,7 @@ class TopK_LLamaAttention(LlamaAttention):
                 # sample <calib_sample_frac> of rows to actually calibrate on (bias towards the less sampled ones so far)
                 sampled_row_th_rowids = self.sample_rowids(inference_phase, self.calib_sample_frac, kv_seq_len, K)  # row indices in ~ U[0, seq_len - k) for prefill, and either [0] or [] for generative_decoding
                 for sample_id, head_id, quant_row_id in itertools.product(range(BATCH_SIZE), range(NHEADS), sampled_row_th_rowids):
-                    rowid_per_row_exp_sums = quant_row_id + r  # attention row corresponding to this quant row
+                    rowid_per_row_exp_sums = quant_row_id + r_chunk  # attention row corresponding to this quant row
                     row_seq_len = rowid_per_row_exp_sums + 1 if inference_phase=="prefill" else kv_seq_len  # the sequence length corresponding to this threshold row
                     row_th = quant[sample_id, head_id, quant_row_id].tolist() # list containing row_seqlen-1 thresholds
     
@@ -541,16 +719,16 @@ class TopK_LLamaAttention(LlamaAttention):
                 assert replacement_value == torch.finfo(attn_weights.dtype).min  # implicitly validates pre-softmax placement
                 if self.mode == 0:
                     #  apply the opposite of the top-th (keep below-or-equal to threshold)- with the so-far calibrated threshold 
-                    per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, max(kv_seq_len-q_len+1,K+1), kv_seq_len, normalize=True)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row thresholds. Also normalize! because the thresholds are now only sums (calibration ongoing)
+                    per_head_row_thresholds = self.get_threshold_tensor(0, NHEADS - 1, max(kv_seq_len-q_chunk_len+1,K+1), kv_seq_len, normalize=True)  # [NHEADS, SEQ_LEN-K] - a 2D matrix of per-head-per-row thresholds. Also normalize! because the thresholds are now only sums (calibration ongoing)
                     per_head_row_thresholds = per_head_row_thresholds.to(device=attn_weights.device, dtype=attn_weights.dtype)
-                    unselected_attn_weights = torch.where(attn_weights[:,:,r:,:] <= per_head_row_thresholds.unsqueeze(0).unsqueeze(-1), 
-                                                          attn_weights[:,:,r:,:], 
+                    unselected_attn_weights = torch.where(attn_weights[:,:,r_chunk:,:] <= per_head_row_thresholds.unsqueeze(0).unsqueeze(-1), 
+                                                          attn_weights[:,:,r_chunk:,:], 
                                                           replacement_value).to(torch.float32)
 
                 elif self.mode == 1:
                     #  apply bottom-(N-k), check how many elements left per row                   
-                    vals, idxs = attn_weights[:,:,r:,:].topk(kv_seq_len-K, dim=-1, largest=False, sorted=False) # Non-top-k <==> Bottom-N-K
-                    unselected_attn_weights = torch.full(attn_weights[:,:,r:,:].size(), 
+                    vals, idxs = attn_weights[:,:,r_chunk:,:].topk(kv_seq_len-K, dim=-1, largest=False, sorted=False) # Non-top-k <==> Bottom-N-K
+                    unselected_attn_weights = torch.full(attn_weights[:,:,r_chunk:,:].size(), 
                                                          replacement_value, 
                                                          dtype=attn_weights.dtype,
                                                          device=attn_weights.device).scatter_(-1, idxs, vals).to(torch.float32)
@@ -558,11 +736,11 @@ class TopK_LLamaAttention(LlamaAttention):
                     assert False, "--sdc 'offline-calibrated' is only allowed for mode=0 or 1."
                 
                 # find sum(exp(a_i - max(a))) across each row vector "a", where a_i are non-top-k / below-threshold elements. Note that the max(a) s taken across all the elements (including the kept once)
-                per_row_exp_maxes = attn_weights[:,:,r:,:].max(dim=-1, keepdims=True)[0]
-                per_row_exp_sums = torch.exp(unselected_attn_weights - per_row_exp_maxes).sum(dim=-1).to(query_states.dtype)  # [BATCH_SIZE, NHEADS, SEQ_LEN-K]
+                per_row_exp_maxes = attn_weights[:,:,r_chunk:,:].max(dim=-1, keepdims=True)[0]
+                per_row_exp_sums = memory_efficient_sum_reduction(torch.exp(unselected_attn_weights - per_row_exp_maxes), dim=-1).to(attn_weights.dtype)  # [BATCH_SIZE, NHEADS, SEQ_LEN-K]
                 # per_row_avg_exp_sum = per_row_exp_sums.view([BATCH_SIZE * NHEADS, SEQ_LEN - K]).mean(0)  # for every token position (attenton row) find an average
                 for sample_id, head_id, sampled_row_id in itertools.product(range(BATCH_SIZE), range(NHEADS), sampled_row_th_rowids):
-                    row_seq_len = sampled_row_id + r + 1 if inference_phase=="prefill" else kv_seq_len
+                    row_seq_len = sampled_row_id + r_chunk + 1 if inference_phase=="prefill" else kv_seq_len
                     exp_sum = per_row_exp_sums[sample_id,head_id,sampled_row_id].item()
                     if row_seq_len not in self.sdc_list[head_id]:
                         self.sdc_list[head_id][row_seq_len] = [exp_sum]
@@ -575,8 +753,8 @@ class TopK_LLamaAttention(LlamaAttention):
                 # process the attn_weights as if top-k was performed. This 
                 # should help the subsequence layers of the model to calibrate 
                 # on a more accurately represented (sparsified) activations
-                vals, idxs = attn_weights[:,:,r:,:].topk(K, dim=-1)
-                attn_weights[:,:,r:,:] = torch.full(attn_weights[:,:,r:,:].size(), 
+                vals, idxs = attn_weights[:,:,r_chunk:,:].topk(K, dim=-1)
+                attn_weights[:,:,r_chunk:,:] = torch.full(attn_weights[:,:,r_chunk:,:].size(), 
                                                     replacement_value, 
                                                     dtype=attn_weights.dtype, 
                                                     device=attn_weights.device).scatter_(-1, idxs, vals)
@@ -625,33 +803,83 @@ class TopK_LLamaAttention(LlamaAttention):
                 self.calibrate = False # prevent further calibration (important when there are some generataive decoding passes that will still be invoked)
 
         return attn_weights, attn_scores_unselected, attn_top_mask
+
+    def triangle_area_incl_diagonal(self, side_length:int) -> int:
+            """
+            compute an area of a lower trinagle matrix including the main diagonal
+            """
+            return side_length * (side_length + 1) / 2
     
-    def dump_stats_attn_elem_and_v_row_full(self, attn_top_mask_shape: Tuple[int,int,int,int], inference_phase:str):
+    def compute_buff_occupancy_topk_per_head(self, inference_phase:str, k:int, kv_seq_len:int, start_idx:int, end_idx:int) -> int:
+        """
+        return the number number of attention elements that the Top-k-Attention method would keep per attention head
+        considering that the attention is **chunked during the prefill** i.e. taking only the rows [start_idx, end_idx)
+        """
+
+        # the row idx k-1 is an important row id, because it corresponds to 
+        # kv_seq_len = k, hence it's the last row where top-k attnetion will 
+        # keep all elements
+        k_idx = k - 1 
+
+        if 0 < k <= kv_seq_len:
+            # topk-k will take all elements only until row k_idx (inclusive), after which it will take only k
+            if inference_phase=="generative_decoding":
+                buff_occupancy_topk_per_head = k
+            else:
+                assert (start_idx < end_idx)
+                if end_idx <= k_idx:
+                    # take the entire lower triangle (triangle until row "end_idx" minus triangle of previous chunks)
+                    triangle_until_end_idx = self.triangle_area_incl_diagonal(end_idx)
+                    trinangle_of_previous_chunks = self.triangle_area_incl_diagonal(start_idx) # note: row start_idx is excluded from this area
+                    buff_occupancy_topk_per_head = triangle_until_end_idx - trinangle_of_previous_chunks
+                if start_idx < k_idx < end_idx:
+                    above_k = self.triangle_area_incl_diagonal(k_idx) - self.triangle_area_incl_diagonal(start_idx) # difference between a triangle that ends at row k-1 (exclusive) and the triangle area of previous chunks (before start_idx - exclusive)
+                    below_k = (end_idx - k_idx) * k  # rectangle that includes tow k_idx, ..., end_idx-1
+                    buff_occupancy_topk_per_head = above_k + below_k
+                else: # k_idx <= start_idx: take a rectangle
+                    buff_occupancy_topk_per_head = (end_idx - start_idx) * k
+        else:
+            # easy case when no topk can even be applied (sequence length shorter than k)
+            if inference_phase=="generative_decoding":
+                buff_occupancy_topk_per_head = kv_seq_len 
+            else:
+                # take the entire lower triangle and subtract the previous chunks' triangle
+                triangle_until_end_idx = self.triangle_area_incl_diagonal(end_idx)
+                trinangle_of_previous_chunks = self.triangle_area_incl_diagonal(start_idx)
+                buff_occupancy_topk_per_head = triangle_until_end_idx - trinangle_of_previous_chunks
+        
+        return buff_occupancy_topk_per_head  
+
+
+    def dump_stats_attn_elem_and_v_row_full(self, attn_top_mask_shape: Tuple[int,int,int,int], inference_phase:str, start_idx:int, end_idx:int):
         """
         Assuming that the entire causal matrix has been processed,
         write 2 statistics files per-layer
             <products_dir_path>/layer<id>_kept_attn_<inference_phase>.csv (per-head statistics)
             <products_dir_path>/layer<id>_kept_vrow_<inference_phase>.csv (per group statistics)
-        """
-        batch_size, num_heads, q_len, kv_seq_len = attn_top_mask_shape
-        assert(inference_phase!="prefill" or q_len==kv_seq_len)
-        assert(inference_phase!="generative_decoding" or q_len==1)
+        """       
+        batch_size, num_heads, q_chunk_len, kv_seq_len = attn_top_mask_shape
+        assert(inference_phase!="prefill" or 1 < q_chunk_len <= self.max_q_chunk_size)
+        assert(inference_phase!="generative_decoding" or q_chunk_len == 1)
 
         # per-head attention elements count
-        full_attn_numel_one_head = batch_size * kv_seq_len if inference_phase=="generative_decoding" else batch_size * ((1 + kv_seq_len) * kv_seq_len / 2)  # causal full matirx
-        with open(f"{self.products_dir_path}/layer{self.id}_kept_attn_{inference_phase}.csv",'a') as f:
-            for b_, h_ in itertools.product(range(batch_size), range(num_heads)):
-                # layer head kv-seq-len kept_attn_numel_per_head full_attn_numel_one_head
-                f.write(f'{self.id},{h_},{kv_seq_len},{full_attn_numel_one_head},{full_attn_numel_one_head}\n')          
+        if f'kept_attn_{inference_phase}' in self.dump_stats_set:
+            full_attn_numel_one_head = batch_size * kv_seq_len if inference_phase=="generative_decoding" else batch_size * (self.triangle_area_incl_diagonal(end_idx) - self.triangle_area_incl_diagonal(start_idx))  # causal full attn matrix within the chunk rows [start_idx,end_idx)
+            with open(f"{self.products_dir_path}/layer{self.id}_kept_attn_{inference_phase}.csv",'a') as f:
+                for b_, h_ in itertools.product(range(batch_size), range(num_heads)):
+                    # layer head kv-seq-len kept_attn_numel_per_head full_attn_numel_one_head
+                    f.write(f'{self.id},{h_},{kv_seq_len},{full_attn_numel_one_head},{full_attn_numel_one_head}\n')          
 
         # per-group V-row read count     
-        full_vrow_num_per_group = kv_seq_len
-        with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_{inference_phase}.csv",'a') as f:
-            for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
-                # layer group kv-seq-len kept_vrow_num_per_group full_vrow_num_per_group
-                f.write(f'{self.id},{g_},{kv_seq_len},{full_vrow_num_per_group},{full_vrow_num_per_group}\n') 
+        if f'kept_vrow_{inference_phase}' in self.dump_stats_set:
+            full_vrow_num_per_group = kv_seq_len if inference_phase=="generative_decoding" else end_idx
+            with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_{inference_phase}.csv",'a') as f:
+                for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
+                    # layer group kv-seq-len kept_vrow_num_per_group full_vrow_num_per_group
+                    f.write(f'{self.id},{g_},{kv_seq_len},{full_vrow_num_per_group},{full_vrow_num_per_group}\n') 
 
-    def dump_stats_attn_elem_and_v_row_from_mask(self, attn_top_mask: torch.Tensor, inference_phase:str):
+
+    def dump_stats_attn_elem_and_v_row_from_mask(self, attn_top_mask: torch.Tensor, inference_phase:str, start_idx:int, end_idx:int):
         """
         Assuming that only the selected elements of the attention matrix have been processed,
         write 3 statistics files per-layer 
@@ -659,35 +887,40 @@ class TopK_LLamaAttention(LlamaAttention):
             <products_dir_path>/layer<id>_kept_vrow_<inference_phase>.csv (per group statistics)
             <products_dir_path>/layer<id>_kept_vrow_popularities_<inference_phase>.txt" (per group statistics)
         """
-        batch_size, num_heads, q_len, kv_seq_len = attn_top_mask.size() 
+        
+        batch_size, num_heads, q_chunk_len, kv_seq_len = attn_top_mask.size() 
 
-        assert(inference_phase!="prefill" or q_len==kv_seq_len)
-        assert(inference_phase!="generative_decoding" or q_len==1)
+        assert(inference_phase!="prefill" or 1 < q_chunk_len <= self.max_q_chunk_size)
+        assert(inference_phase!="generative_decoding" or q_chunk_len == 1)
 
         # per-head attention elements count
-        kept_attn_numel_per_head = attn_top_mask.sum(dim=(2,3))  # [B,NH]
-        full_attn_numel_one_head = batch_size * kv_seq_len if inference_phase=="generative_decoding" else batch_size * ((1 + kv_seq_len) * kv_seq_len / 2)  # causal full matirx
-        with open(f"{self.products_dir_path}/layer{self.id}_kept_attn_{inference_phase}.csv",'a') as f:
-            for b_, h_ in itertools.product(range(batch_size), range(num_heads)):
-                # layer head kv-seq-len kept_attn_numel_per_head full_attn_numel_one_head
-                f.write(f'{self.id},{h_},{kv_seq_len},{kept_attn_numel_per_head[b_, h_]},{full_attn_numel_one_head}\n')        
+        if f'kept_attn_{inference_phase}' in self.dump_stats_set:
+            kept_attn_numel_per_head = memory_efficient_sum_reduction(attn_top_mask, dim=(2,3))  # returns a tensor of counters, shape: [B,NH]
+            full_attn_numel_one_head = batch_size * kv_seq_len if inference_phase=="generative_decoding" else batch_size * (self.triangle_area_incl_diagonal(end_idx) - self.triangle_area_incl_diagonal(start_idx))  # causal full attn matirx within the chunk rows [start_idx,end_idx)
+            with open(f"{self.products_dir_path}/layer{self.id}_kept_attn_{inference_phase}.csv",'a') as f:
+                for b_, h_ in itertools.product(range(batch_size), range(num_heads)):
+                    # layer head kv-seq-len kept_attn_numel_per_head full_attn_numel_one_head
+                    f.write(f'{self.id},{h_},{kv_seq_len},{kept_attn_numel_per_head[b_, h_]},{full_attn_numel_one_head}\n')        
 
         # per-group V-row popularity counters (each line - <kv_seq_len> popularity counters)
-        popcount_vrow_per_head = attn_top_mask.sum(dim=2)  # [B,NH,kv_seq_len] for every v-row index - count how many attention rows need it
-        popcount_vrow_per_head_grouped = popcount_vrow_per_head.reshape(batch_size, self.num_key_value_heads, self.num_key_value_groups, kv_seq_len)  # [B,NHKV,G,kv_seq_len]
-        popcount_vrow_per_group = popcount_vrow_per_head_grouped.sum(dim=2)  # [B,NHKV,kv_seq_len]
-        with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_popularities_{inference_phase}.txt",'a') as f:
-            for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
-                # layer group kv-seq-len comma-separated-per-v-row-id-counts-of-popularities
-                f.write(f'{self.id},{g_},{kv_seq_len},{popcount_vrow_per_group[b_, g_].tolist()}\n')      
+        if f'kept_vrow_popularities_{inference_phase}' in self.dump_stats_set or f'kept_vrow_{inference_phase}' in self.dump_stats_set:
+            popcount_vrow_per_head = memory_efficient_sum_reduction(attn_top_mask, dim=2)  # [B,NH,kv_seq_len] for every v-row index - count how many attention rows need it
+            popcount_vrow_per_head_grouped = popcount_vrow_per_head.reshape(batch_size, self.num_key_value_heads, self.num_key_value_groups, kv_seq_len)  # [B,NHKV,G,kv_seq_len]
+            popcount_vrow_per_group = popcount_vrow_per_head_grouped.sum(dim=2)  # [B,NHKV,kv_seq_len]
+            if f'kept_vrow_popularities_{inference_phase}' in self.dump_stats_set: 
+                with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_popularities_{inference_phase}.txt",'a') as f:
+                    for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
+                        # layer group kv-seq-len comma-separated-per-v-row-id-counts-of-popularities
+                        f.write(f'{self.id},{g_},{kv_seq_len},{popcount_vrow_per_group[b_, g_].tolist()}\n')      
 
-        # per-group V-row read count     
-        kept_vrow_num_per_group = popcount_vrow_per_group.count_nonzero(dim=2)  # [B,NHKV]
-        full_vrow_num_per_group = kv_seq_len
-        with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_{inference_phase}.csv",'a') as f:
-            for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
-                # layer group kv-seq-len kept_vrow_num_per_group full_vrow_num_per_group
-                f.write(f'{self.id},{g_},{kv_seq_len},{kept_vrow_num_per_group[b_, g_]},{full_vrow_num_per_group}\n') 
+            # per-group V-row read count     
+            if f'kept_vrow_{inference_phase}' in self.dump_stats_set:
+                kept_vrow_num_per_group = popcount_vrow_per_group.count_nonzero(dim=2)  # [B,NHKV]
+                full_vrow_num_per_group = kv_seq_len if inference_phase=="generative_decoding" else end_idx        
+                with open(f"{self.products_dir_path}/layer{self.id}_kept_vrow_{inference_phase}.csv",'a') as f:
+                    for b_, g_ in itertools.product(range(batch_size), range(self.num_key_value_heads)):  #num_key_value_heads is actually key-value groups of query heads (each group containns num_key_value_groups query heads associated to 1 kv_head)
+                        # layer group kv-seq-len kept_vrow_num_per_group full_vrow_num_per_group
+                        f.write(f'{self.id},{g_},{kv_seq_len},{kept_vrow_num_per_group[b_, g_]},{full_vrow_num_per_group}\n') 
 
 
 # %% Update the Vanilla model with Top-K layers
@@ -828,6 +1061,10 @@ def set_params(model, **params):
             attention.calib_load_path = params['calib_load_path']
             attention.capk = params['capk']
             attention.dump_qkv=params['dump_qkv']
+            attention.dump_stats_set={'kept_attn_generative_decoding', 'kept_attn_prefill', 
+                                      'kept_vrow_generative_decoding', 'kept_vrow_prefill', 
+                                      'kept_vrow_popularities_generative_decoding', 
+                                      'kept_vrow_popularities_prefill'} - params['dump_stats_set_exclude']
 
             # Reset calibraton-related values
             if attention.calib_load_path != "":

@@ -29,8 +29,8 @@ args = parser.parse_args()
 DPI=300
 
 # Derive the number of layers from the title.
-model_layers = {'LLaMA2-7b':32, 'LLaMA2-70b':80, 'CodeLLaMA-34b':48, 'LLaMA-3-8B':32, 'LLaMA3-70B':80}
-model_heads = {'LLaMA2-7b':32, 'LLaMA2-70b':64, 'CodeLLaMA-34b':64, 'LLaMA-3-8B':32, 'LLaMA3-70B':64}
+model_layers = {'LLaMA2-7b':32, 'LLaMA2-70b':80, 'CodeLLaMA-34b':48, 'LLaMA-3-8B':32, 'LLaMA-3.1-8B-Instruct':32}
+model_heads = {'LLaMA2-7b':32, 'LLaMA2-70b':64, 'CodeLLaMA-34b':64, 'LLaMA-3-8B':32, 'LLaMA-3.1-8B-Instruct':32}
 model_num_attn_layers = None
 model_num_attn_heads = None
 for model_name in model_layers.keys():
@@ -43,32 +43,50 @@ if model_num_attn_layers is None or model_num_attn_heads is None:
     print(' ' + '\n '.join(model_layers.keys()))
     exit(-1)
 
-# Read samples.jsonl_results.jsonl
-with open(args.products_dir_path + "/samples.jsonl_results.jsonl") as json_file:
-    results_dicts_lst = [json.loads(line.strip()) for line in json_file]
-    results_df = pd.DataFrame(results_dicts_lst)
-
-
 # Read prompt_completion_lengths_per_sample.csv
 seq_len_df = pd.read_csv(args.products_dir_path+"/prompt_completion_lengths_per_sample.csv", 
 			 delimiter=" ", 
 			 header=None, 
 			 names=["seq_len_prompt", "seq_len_completion"])
 
-# concatenate the two dataframes
-df = pd.concat([results_df, seq_len_df], axis=1)
-df['seq_len_total'] = df.seq_len_prompt + df.seq_len_completion
-
 # Plot dataset sequence lengths
 img_filename = args.products_dir_path + '/prompt_lengths.png'
 print(f"Plotting dataset (prompt) sequence lengths histogram ({img_filename})")
-ax = df[['task_id','seq_len_prompt']].drop_duplicates().seq_len_prompt.plot.hist(bins=30)
-ax.set_ylabel(f"Number of prompts (total {df.task_id.nunique()})")
-ax.set_xlabel(f"Prompt length in tokens (average {df.seq_len_prompt.mean():.1f})")
+ax = seq_len_df.seq_len_prompt.plot.hist(bins=30)
+ax.set_ylabel(f"Number of prompts (total {len(seq_len_df)})")
+ax.set_xlabel(f"Prompt length in tokens (min:{seq_len_df.seq_len_prompt.min():,d}, average {seq_len_df.seq_len_prompt.mean():,.1f} max: {seq_len_df.seq_len_prompt.max():,d})")
 ax.set_title("Prompt Sequence Lengths")
 fig = ax.get_figure()
 fig.savefig(img_filename, dpi=DPI)
 plt.close(fig)
+
+# Plot completion lengths
+img_filename = args.products_dir_path + '/completion_lengths_simple.png'
+print(f"Plotting completion sequence lengths histogram ({img_filename})")
+ax = seq_len_df.seq_len_completion.plot.hist(bins=30)
+ax.set_ylabel(f"Number of completions (total {len(seq_len_df)})")
+ax.set_xlabel(f"Completion length in tokens (min:{seq_len_df.seq_len_completion.min():,d}, average {seq_len_df.seq_len_completion.mean():,.1f} max: {seq_len_df.seq_len_completion.max():,d})")
+ax.set_title("Completion Sequence Lengths")
+fig = ax.get_figure()
+fig.savefig(img_filename, dpi=DPI)
+plt.close(fig)
+
+
+# Read samples.jsonl_results.jsonl
+try:
+    results_file_path = args.products_dir_path + "/samples.jsonl_results.jsonl"
+    with open() as json_file:
+        results_dicts_lst = [json.loads(line.strip()) for line in json_file]
+        results_df = pd.DataFrame(results_dicts_lst)
+except:
+    print(f"Error: could't open {results_file_path} to read the correct/incorrect results from. Stopping. ")
+    exit(0)
+
+# concatenate the two dataframes
+df = pd.concat([results_df, seq_len_df], axis=1)
+df['seq_len_total'] = df.seq_len_prompt + df.seq_len_completion
+
+
 
 # Plot completion sequence lengths
 img_filename = args.products_dir_path + '/completion_lengths.png'

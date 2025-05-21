@@ -92,17 +92,17 @@ def aggregate_accuracy_and_size_of_many_runs(results_meta_list:List[ResultMeta],
 def find_accuracy_mapper(arg: Tuple[str,str,str]) -> Union[Tuple[str, float, float], Tuple[None,None,None]]:
     return find_accuracy(*arg)
 
-def find_accuracy( accuracy_metric:str, timestamp:str, results_dir_path:str) -> Union[Tuple[str, float, float], Tuple[None,None,None]]:
+def find_accuracy(accuracy_metric:str, timestamp:str, results_dir_path:str) -> Union[Tuple[str, float, float], Tuple[None,None,None]]:
     if accuracy_metric=='acc_norm':
         model_name, accuracy_mean, accuracy_std = find_acc_norm(timestamp, results_dir_path) 
-    elif accuracy_metric=='pass@1':
-        model_name, accuracy_mean, accuracy_std = find_passat1(timestamp, results_dir_path) 
+    elif accuracy_metric in ['pass@1', 'rouge']:
+        model_name, accuracy_mean, accuracy_std = find_passat1_or_rouge(timestamp, results_dir_path, metric=accuracy_metric) 
     else:
         model_name, accuracy_mean, accuracy_std = None, None, None
 
     return model_name, accuracy_mean, accuracy_std
 
-def find_passat1(timestamp:str, dir_path:str) -> Union[Tuple[str, float, float], Tuple[None, None,None]]:
+def find_passat1_or_rouge(timestamp:str, dir_path:str, metric:str) -> Union[Tuple[str, float, float], Tuple[None, None,None]]:
     '''
     Searches in many results (txt) filed for a paragraph describing 
     the acc_nom of a given timestamp run.
@@ -112,20 +112,20 @@ def find_passat1(timestamp:str, dir_path:str) -> Union[Tuple[str, float, float],
     
     matching_files = glob.glob(f"{dir_path}/*.txt")
     for file_path in matching_files:
-        ret_tuple = find_passat1_in_file(timestamp, file_path)
+        ret_tuple = find_passat1_or_rouge_in_file(timestamp, file_path, metric)
         if ret_tuple != (None, None):
             model_name = os.path.basename(file_path).split("_")[0]
             return (model_name,) + ret_tuple
 
-    print(f"Error: couldn't extract pass@1 for timestamp {timestamp} in any of the files within the directory {dir_path}")
+    print(f"Error: couldn't extract {metric} for timestamp {timestamp} in any of the files within the directory {dir_path}")
     return None, None, None
 
 
-def find_passat1_in_file(timestamp:str, file_path:str, verbose:bool=False) -> Union[Tuple[float, float], Tuple[None, None]]:
+def find_passat1_or_rouge_in_file(timestamp:str, file_path:str, metric:str, verbose:bool=False) -> Union[Tuple[float, float], Tuple[None, None]]:
     """
     Read a text file at <file_path> and find a paraagraph that begins with the timestamp
 
-    Example: when a file contains a paragraph like this:
+    Example 1: when a file contains a paragraph like this:
     2024-12-12_14-52-55_962978
     K:[512, 512, 64, 64] mode:1 layer:None placement:pre-softmax
     dataset:openai_humaneval num_tasks:164 num_samples_per_task:1 max_seq_len:2048
@@ -135,10 +135,76 @@ def find_passat1_in_file(timestamp:str, file_path:str, verbose:bool=False) -> Un
 
     Expected output is (0.2439, 0)
 
-    Return: 2-tuple: (pass@1 average, pass@1 std)
+    Example 2: when a file contains a paragraph like this:
+    2025-04-08_21-40-00_676946
+    K:[512, 512, 128, 128] mode:1 layer:None placement:post-softmax 
+    dataset:longbench_qmsum num_tasks:20 num_samples_per_task:1 max_seq_len:2048 prompt_prefix:'' prompt_suffix:''
+    | Metric |  Score  |
+    |--------|---------|
+    |rouge   | 21.3800 |
+
+    Expected output is (21.38, 0)
+
+    Return: 2-tuple: (pass@1 average, pass@1 std) - if metric==pass@1
+            2-tuple: (rouge average, rouge std) - if metric==rouge
 
     """
-    METRIC = 'pass@1'
+
+    with open(file_path, 'r') as file:
+        content = file.read()
+
+    # Split the content into paragraphs
+    paragraphs = content.split('\n\n')
+
+    # Find the paragraph that starts with the given timestamp
+    target_paragraph = None
+    for paragraph in paragraphs:
+        if paragraph.strip().startswith(timestamp):
+            target_paragraph = paragraph
+            break
+
+    if not target_paragraph:
+        if verbose:
+            print("Error: file {file_path} doesn't contain the required timestamp {timestamp}")
+        return None, None  # Timestamp not found
+
+    # Find the acc_norm line in the paragraph
+    target_paragraph_lines = list(map(str.strip,filter(len,target_paragraph.split('\n'))))
+    columns = list(map(str.strip,target_paragraph_lines[-3].split('|')))
+    target_paragraph_last_row_values = target_paragraph_lines[-1].split('|')
+
+    if len(target_paragraph_last_row_values) != len(columns):
+        if verbose:
+            print("Error: the last row of the paragraph is not equal in length to the column-name line")
+        return None, None
+    elif metric not in map(str.strip,target_paragraph_last_row_values):
+        if verbose:
+            print(f"Error: the last row of the paragraph does not contain the {metric} metric")
+        return None, None        
+    else:
+        acc_norm = float(target_paragraph_last_row_values[columns.index('Score')])
+        acc_norm_stderr = 0
+        return acc_norm, acc_norm_stderr 
+
+
+def find_rouge_in_file(timestamp:str, file_path:str, verbose:bool=False) -> Union[Tuple[float, float], Tuple[None, None]]:
+    """
+    Read a text file at <file_path> and find a paraagraph that begins with the timestamp
+
+    Example: when a file contains a paragraph like this:
+    2025-04-08_21-40-00_676946
+    K:[512, 512, 128, 128] mode:1 layer:None placement:post-softmax 
+    dataset:longbench_qmsum num_tasks:20 num_samples_per_task:1 max_seq_len:2048 prompt_prefix:'' prompt_suffix:''
+    | Metric |  Score  |
+    |--------|---------|
+    |rouge   | 21.3800 |
+
+    Expected output is (21.38, 0)
+
+    Return: 2-tuple: (rouge average, pass@1 std)
+
+    """
+    METRIC = 'rouge'
 
     with open(file_path, 'r') as file:
         content = file.read()
@@ -175,6 +241,7 @@ def find_passat1_in_file(timestamp:str, file_path:str, verbose:bool=False) -> Un
         acc_norm = float(target_paragraph_last_row_values[columns.index('Score')])
         acc_norm_stderr = 0
         return acc_norm, acc_norm_stderr 
+
 
 
 def find_acc_norm(timestamp:str, dir_path:str) -> Union[Tuple[float, float], Tuple[None,None]]:

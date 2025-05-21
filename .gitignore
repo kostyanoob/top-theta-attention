@@ -1,0 +1,8 @@
+logs
+figures
+products
+experiments
+launch.json
+.vscode
+*.pyc
+*.db

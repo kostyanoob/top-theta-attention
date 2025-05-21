@@ -22,7 +22,7 @@ parser.add_argument(
     '--llama',
     type=str,
     default='2-7',
-    choices=['2-7','3-8','3-8i','34','2-70','3-70','3-70i'],
+    choices=['2-7','3-8','3-8i','3.1-8i','34','2-70','3-70','3-70i'],
     help='llama model alias to be loaded. specifying "i" after the number implies "Instruct-finetuned"')
 parser.add_argument(
     '--mode',
@@ -73,7 +73,7 @@ parser.add_argument(
     '--task',
     type=str,
     default='hellaswag',
-    choices=['hellaswag', 'arc_challenge', 'arc_easy', 'mmlu', 'gsm8k'],
+    choices=['hellaswag', 'arc_challenge', 'arc_easy', 'mmlu', 'gsm8k', 'medmcqa'],
     help='evaluation task in the lm eval harness.')
 parser.add_argument(
     '--num_samples',
@@ -126,6 +126,11 @@ parser.add_argument(
          " every attention row, prioritizing the last (most recent) tokens. "
          "Applicable only in mode=0.",
     action="store_true")
+parser.add_argument(
+    "--calibrate_only", 
+    help="only calibrate thresholds, store them as th.txt, then don't evaluate."
+         "Applicable only in mode=0.",
+    action="store_true")
 
 # Check validity of cmd-line arguments
 args = parser.parse_args()
@@ -147,8 +152,8 @@ model_name, model_shortname = get_model_names(args.llama)
 cache_prefix_path = f"lm_cache/{model_name}{timestamp}"
 products_dir_path = f"products/{timestamp}"
 os.makedirs(products_dir_path, exist_ok=True)
-os.makedirs("lm_cache", exist_ok=True)
 os.makedirs("results-Llama", exist_ok=True)
+
 device="cuda"
 device_map_option="auto"
 dtype="float16"
@@ -171,11 +176,11 @@ assert(not(args.calib_tac) or args.mode == '0')  # topk-at-calibration should be
 assert(not(args.calib_load_path!="") or args.mode == '0' or args.sdc == 'offline-calibrated')
 assert(not(args.capk) or args.mode == '0')  # --capk can be used only with top-threshld (mode=0)
 assert(0.0 <= args.calib_sample_frac <= 1.0)
+assert(not args.calibrate_only or args.mode=='0' or args.sdc == 'offline-calibrated')
 
 print(f"RUN TIMESTAMP:{timestamp}")
 
 # Load the model from checkpoint
-lm_eval.tasks.initialize_tasks()
 model = get_model(model_type, model_name, device, dtype, batch_size, device_map_option)
 
 # Update the vanilla model's LlamaDecoderLayer layers with top-k parameters
@@ -191,7 +196,6 @@ def run_model(model, tasks_list, num_fewshot, batch_size, n_samples=None):
         device='cuda',
         use_cache=cache_prefix_path,
         limit=n_samples,
-        decontamination_ngrams_path=None,
         check_integrity=False,
         write_out=True,
     )
@@ -218,7 +222,8 @@ for mode in eval('list({'+args.mode+'})'):#0, 1, 3]:
                        calib_load_path=args.calib_load_path,
                        calibrate=False,
                        capk=args.capk,
-                       test_layer=None)
+                       test_layer=None,
+                       dump_qkv=False)
             
         elif mode==0 or args.sdc == "offline-calibrated":
             # calibration is needed prior to an evaluation  
@@ -233,27 +238,30 @@ for mode in eval('list({'+args.mode+'})'):#0, 1, 3]:
                        calib_sample_frac=args.calib_sample_frac, 
                        calibration_requests=calibration_requests, 
                        capk=args.capk,
-                       test_layer=None) 
+                       test_layer=None,
+                       dump_qkv=False) 
             eval_dict = run_model(model, tasks_calibration_list, num_fewshot, batch_size, n_samples=calibration_samples)
             os.remove(f"{cache_prefix_path}_rank0.db")
             
         # Run
-        # for test_layer in [None]: <---- Use this to test for all layers - i.e. Top-K/TH for all layers
-        for test_layer in [None]: #for test_layer in range(num_attn_layers):
+        if not args.calibrate_only:
             set_params(model.model, K=K_list, mode=mode,  placement=placement,
-                       sdc=args.sdc,
-                       sdc_scale=args.sdc_scale,
-                       vmc=args.vmc,
-                       calib_load_path="",
-                       calibrate=False,
-                       capk=args.capk,
-                       test_layer=test_layer)
+                        sdc=args.sdc,
+                        sdc_scale=args.sdc_scale,
+                        vmc=args.vmc,
+                        calib_load_path="",
+                        calibrate=False,
+                        capk=args.capk,
+                        test_layer=None,
+                        dump_qkv=False)
             print(model.model)
             eval_dict = run_model(model, tasks_list, num_fewshot, batch_size, n_samples=args.num_samples)
-            table = lm_eval.evaluator.make_table(eval_dict)
-            with open(f'results-Llama/{model_shortname}_{args.task}_mode{mode}_placement{placement}.txt', 'a') as f:
-                f.write(timestamp + '\n')
-                f.write(f'K:{K_list} mode:{mode} layer:{test_layer} placement:{placement} sdc:{args.sdc} sdc_scale:{args.sdc_scale} vmc:{args.vmc} capk:{args.capk} calib_tac:{args.calib_tac} calib_add_sigma:{args.calib_add_sigma} calib_sample_frac:{args.calib_sample_frac} calib_load_path:{args.calib_load_path}\n')
+            table = lm_eval.utils.make_table(eval_dict)
+
+        with open(f'results-Llama/{model_shortname}_{args.task}_mode{mode}_placement{placement}.txt', 'a') as f:
+            f.write(timestamp + '\n')
+            f.write(f'K:{K_list} mode:{mode} layer:None placement:{placement} sdc:{args.sdc} sdc_scale:{args.sdc_scale} vmc:{args.vmc} capk:{args.capk} calib_tac:{args.calib_tac} calib_add_sigma:{args.calib_add_sigma} calib_sample_frac:{args.calib_sample_frac} calib_load_path:{args.calib_load_path}\n')
+            if not args.calibrate_only:
                 f.write(table + '\n')
                 os.remove(f"{cache_prefix_path}_rank0.db")
 

@@ -17,10 +17,11 @@ def get_task_config(task: str) -> Tuple[int, int, int]:
     """
     if task.startswith('arc_'):
         num_fewshot = 25
-        calibration_samples = 120  # ~10% of the test dataset
         if task=='arc_challenge':
-            calibration_requests = calibration_samples * 4
+            calibration_samples = 120
+            calibration_requests = 431 # in lm_eval v0.4.8: 49 out of 480 requests didn't invoke the model run (some caching in lm_eval/models/huggingface.py avoids running the model)
         elif task=='arc_easy':
+            calibration_samples = 120  # ~10% of the test dataset
             calibration_requests = calibration_samples * 4 - 1  # peculiarity of this task is to have one less request
         else:
             raise NotImplementedError("only arc_challenge and arc_easy tasks are supported from the ai2_arc challenge tasks.")
@@ -40,4 +41,9 @@ def get_task_config(task: str) -> Tuple[int, int, int]:
         calibration_samples = 120 # TODO: change to ??? to become 10% of the entire dataset
         calibration_requests = calibration_samples * 4  # TODO: change to a correct value, based on the number of inference runs made for the calibration_samples   
     
+    elif 'medmcqa' == task:
+        num_fewshot=5
+        calibration_samples = 120 # TODO: change to ??? to become 10% of the entire dataset
+        calibration_requests = calibration_samples * 4  # TODO: change to a correct value, based on the number of inference runs made for the calibration_samples   
+        
     return num_fewshot, calibration_samples, calibration_requests

@@ -1,6 +1,6 @@
 from operator import itemgetter
 import os
-import pdb
+import pandas as pd
 from typing import Tuple
 import matplotlib as mpl 
 import matplotlib.pyplot as plt
@@ -10,6 +10,7 @@ import scipy
 import tqdm
 color_array = list(mcolors.TABLEAU_COLORS.values())
 mpl.rcParams['agg.path.chunksize'] = 10000
+DPI=300
 
 parser = argparse.ArgumentParser(
     description='Reads the products directory of a single run of test_llama.py '
@@ -29,8 +30,8 @@ parser.add_argument(
 args = parser.parse_args()
 
 # Derive the number of layers from the title.
-model_layers = {'LLaMA2-7b':32, 'LLaMA2-70b':80, 'CodeLLaMA-34b':48, 'LLaMA-3-8B':32, 'LLaMA3-70B':80}
-model_heads = {'LLaMA2-7b':32, 'LLaMA2-70b':64, 'CodeLLaMA-34b':64, 'LLaMA-3-8B':32, 'LLaMA3-70B':64}
+model_layers = {'LLaMA2-7b':32, 'LLaMA-3-8B':32, 'LLaMA-3-8B-Instruct':32, 'LLaMA-3.1-8B-Instruct':32, 'LLaMA2-70b':80, 'LLaMA-3-70B':80, 'CodeLLaMA-34b':48}
+model_heads = {'LLaMA2-7b':32, 'LLaMA-3-8B':32, 'LLaMA-3-8B-Instruct':32, 'LLaMA-3.1-8B-Instruct':32, 'LLaMA2-70b':64, 'LLaMA-3-70B':64, 'CodeLLaMA-34b':64}
 model_num_attn_layers = None
 model_num_attn_heads = None
 for model_name in model_layers.keys():
@@ -42,6 +43,28 @@ if model_num_attn_layers is None or model_num_attn_heads is None:
     print(f"Error: the provided -run_name \"{args.title}\" must contain one of the supported models:")
     print(' ' + '\n '.join(model_layers.keys()))
     exit(-1)
+
+
+#### 
+# Read prompt_completion_lengths_per_sample.csv
+try:
+    seq_len_df = pd.read_csv(args.products_dir_path+"/sequence_lengths_per_example.csv", 
+                delimiter=" ", 
+                header=None, 
+                names=["seq_len_prompt"])
+
+    # Plot dataset sequence lengths
+    img_filename = args.products_dir_path + '/prompt_lengths.png'
+    print(f"Plotting dataset (prompt) sequence lengths histogram ({img_filename})")
+    ax = seq_len_df.seq_len_prompt.plot.hist(bins=30)
+    ax.set_ylabel(f"Number of prompts (total {len(seq_len_df)})")
+    ax.set_xlabel(f"Prompt length in tokens (min:{seq_len_df.seq_len_prompt.min():,d}, average {seq_len_df.seq_len_prompt.mean():,.1f} max: {seq_len_df.seq_len_prompt.max():,d})")
+    ax.set_title("Prompt Sequence Lengths")
+    fig = ax.get_figure()
+    fig.savefig(img_filename, dpi=DPI)
+    plt.close(fig)
+except Exception as e:
+    print(f"couldn't produce sequence length figure - {e}")    
 
 #### PLOT THRESHOLD AS A FUNCTION OF SEQUENCE LENGTH - Separate subplot per layer #####
 if model_num_attn_layers == 32:
