@@ -43,8 +43,6 @@ def generate_one_completion(tokenizer: AutoTokenizer,
         prompt_text - str - input text to produce the completion for
         prompt_prefix: str - optional text to prepend before the prompt_text
         prompt_suffix: str - optional text to append after the prompt_text
-        prompt_prefix: str - optional text to prepend before the prompt_text
-        prompt_suffix: str - optional text to append after the prompt_text
         products_dir_path: str - path to a directory where the csv file with 
                            prompt lengths should be created. if None - don't
                            create such a file.
@@ -53,22 +51,7 @@ def generate_one_completion(tokenizer: AutoTokenizer,
 
     Returns: a concatenation of {prompt, generated} strings. Without the 
              prefix/suffix if provided
-    Returns: a concatenation of {prompt, generated} strings. Without the 
-             prefix/suffix if provided
     """
-    # modified_prompt = prefix + prompt + suffix
-    modified_prompt_text = prompt_prefix + prompt_text + prompt_suffix
-
-    # tokenize the modified prompt
-    modified_prompt_ids = tokenizer.encode(modified_prompt_text, padding=True, return_tensors="pt").to(model.device)
-
-    # Run the model to get the generated tokens (use the special terminator tokens - important to stop repetitive garbage generation)
-    terminators = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|eot_id|>")]
-    modified_prompt_and_completion_ids = model.generate(modified_prompt_ids, eos_token_id=terminators)
-    
-    # Get rid of the prefix and suffix that were used engineering the prompt in this function
-    completion_text = tokenizer.decode(modified_prompt_and_completion_ids[0][len(modified_prompt_ids[0]):], skip_special_tokens=True)
-    prompt_and_completion_text = prompt_text + completion_text # excludes prefix and suffix
     # modified_prompt = prefix + prompt + suffix
     modified_prompt_text = prompt_prefix + prompt_text + prompt_suffix
 
@@ -86,10 +69,6 @@ def generate_one_completion(tokenizer: AutoTokenizer,
     # write (prompt-length, generated-length) to a file
     if products_dir_path is not None:
         with open(f"{products_dir_path}/prompt_completion_lengths_per_sample.csv",'a') as f:
-            for b_ in range(modified_prompt_ids.shape[0]):
-                modified_prompt_len = len(modified_prompt_ids[b_])
-                competion_len = len(modified_prompt_and_completion_ids[b_]) - len(modified_prompt_ids[b_])
-                f.write(f'{modified_prompt_len} {competion_len}\n')
             for b_ in range(modified_prompt_ids.shape[0]):
                 modified_prompt_len = len(modified_prompt_ids[b_])
                 competion_len = len(modified_prompt_and_completion_ids[b_]) - len(modified_prompt_ids[b_])
@@ -171,7 +150,7 @@ def gzip_one_file_remove(in_file:str) -> bool:
 
 def gzip_one_file_keep(in_file:str) -> bool:
     """
-    compresses the file using gzip and removes the original uncompressed file
+    compresses the file using gzip and keeps the original uncompressed file
 
     Returns:
         True if and only if there was no problem compressing the file
