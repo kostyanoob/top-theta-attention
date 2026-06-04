@@ -1,15 +1,10 @@
 # Top-k & Top-θ Attention for Large Language Models
 
-<p align="center">
-  <a href="https://e-nns.org/icann2026/">
-    <img src="https://img.shields.io/badge/ICANN%202026-Accepted-brightgreen?style=for-the-badge&logo=academia&logoColor=white" alt="Accepted at ICANN 2026"/>
-  </a>
-  <a href="https://arxiv.org/abs/2502.08363">
-    <img src="https://img.shields.io/badge/arXiv-2502.08363-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv 2502.08363"/>
-  </a>
-  <img src="https://img.shields.io/badge/License-BSD%203--Clause-blue?style=for-the-badge" alt="License: BSD 3-Clause"/>
-  <img src="https://img.shields.io/github/stars/huawei-csl/top-theta-attention?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Stars"/>
-</p>
+[![ICANN 2026](https://img.shields.io/badge/ICANN%202026-Accepted-brightgreen.svg)](https://e-nns.org/icann2026/)
+[![arXiv](https://img.shields.io/badge/arXiv-2502.08363-b31b1b.svg)](https://arxiv.org/abs/2502.08363)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Paper-ffc107?color=ffc107&logoColor=white)](https://huggingface.co/papers/2502.08363)
+[![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![GitHub stars](https://img.shields.io/github/stars/huawei-csl/top-theta-attention?label=Stars&logo=github&logoColor=white&style=flat-square)](https://github.com/huawei-csl/top-theta-attention/stargazers)
 
 ---
 
